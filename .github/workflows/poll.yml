@@ -1,8 +1,12 @@
 name: Poll OpenAI Batches
 
 on:
+  # bonus_ui.py가 배치 제출 직후 완료를 직접 감지해 workflow_dispatch로 즉시 깨움
+  # (실측 2~3분 내). 이 schedule은 그 즉시-트리거가 놓친 경우(GUI 종료 등)를 위한
+  # 저빈도 백업일 뿐 - */10으로 걸어놔도 GitHub이 실제론 최대 2시간 이상 지연시키는
+  # 걸 확인해서(2026-09-11) 그 착각을 부르는 촘촘한 스케줄 대신 1시간으로 낮춤.
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '0 * * * *'
   workflow_dispatch: {}
 
 permissions:

@@ -1,9 +1,13 @@
 """
 openai-batch/poll_batches.py
 
-GitHub Actions에서 10분마다 실행. 카드뉴스 번역 파이프라인
+GitHub Actions에서 실행. 카드뉴스 번역 파이프라인
 (bonus_model_interfaces.submit_translation_batch)이 제출해둔 OpenAI Batch API
 작업 중 완료된 것을 찾아 결과를 각 채널 워크북의 TRANSLATE_DATA 탭에 채워넣는다.
+
+트리거는 두 가지: (1) submit_translation_batch가 제출 직후 배치 완료를 직접
+감지해 즉시 쏘는 workflow_dispatch(평소엔 이걸로 2~3분 내 처리), (2) 1시간
+간격 schedule cron - (1)이 놓친 경우(GUI 종료 등)를 위한 저빈도 백업(2026-09-11).
 
 - 대상 판별: status=="completed" AND metadata.contents_sheet_id가 있는 배치만
   (이 프로젝트가 제출한 배치는 전부 submit_translation_batch가 이 키를 채워서 만듦 -
