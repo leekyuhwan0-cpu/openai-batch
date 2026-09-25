@@ -58,17 +58,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REQUEST_TIMEOUT = 30
 MAX_BATCH_AGE_SEC = 3 * 24 * 3600
 
-# 줄바꿈 후처리 하드코딩 기준값 (2026-09-25, dunya_hikayeler 하단 2~3줄 스타일 기준으로
-# 확정 - 채널별 스키마 대신 하드코딩하기로 사용자 결정. yakindan_uzaktan처럼 자체
-# block 줄바꿈을 쓰는 채널은 렌더 시 이 \n을 최소 경계로 두고 자기 폰트/폭으로 재분할
-# 하므로 문제없음).
-LINEBREAK_FONT_PATH = os.path.join(HERE, "fonts", "Alexandria-Bold.ttf")
+# 줄바꿈 후처리 하드코딩 기준값 (2026-09-25, "하단 2~3줄" hookline 스타일 채널
+# 기준으로 언어별 확정 - 채널별 스키마 대신 언어별 하드코딩하기로 사용자 결정.
+# 폰트/start_size는 MY_CHANNELS.main_design에서 실측(폰트가 다르면 textlength 측정이
+# 전혀 안 맞아서 언어별로 반드시 갈라야 함 - 특히 ja/kr은 Alexandria-Bold에 글리프가
+# 아예 없어 tofu 폭으로 측정되는 버그였음).
+#   tr -> dunya_hikayeler, kr -> 이세상이야기, ja -> sekai_archive_jp (전부 style 없음=hookline)
+#   de(welt.fakten_de)는 style="centered"라 렌더 시 자기 폰트/폭으로 완전히 재계산하므로
+#   (yakindan_uzaktan/tr2와 동일 카테고리) 이 표에 넣어도 결과에 큰 영향 없지만, 실제
+#   채널 폰트로 맞춰서 이식해둠.
+#   표에 없는 target_lang은 줄바꿈 후처리 자체를 건너뛴다(폰트 없이 잘못 쪼개는 사고 방지).
 LINEBREAK_MAX_WIDTH = 1080 - 2 * int(1080 * 0.06)  # generate_card.py render_one()과 동일 (952)
-LINEBREAK_START_SIZE = 70
 LINEBREAK_PREFERRED_LINES = 2
 LINEBREAK_MAX_LINES = 3
 LINEBREAK_MIN_SIZE = 44
 LINEBREAK_WEIGHT = "Black"
+
+LINEBREAK_PARAMS = {
+    "tr": {"font": os.path.join(HERE, "fonts", "Alexandria-Bold.ttf"), "start_size": 70},
+    "kr": {"font": os.path.join(HERE, "fonts", "KOHI배움 TTF.ttf"), "start_size": 70},
+    "ja": {"font": os.path.join(HERE, "fonts", "NotoSansJP-VF.ttf"), "start_size": 70},
+    "de": {"font": os.path.join(HERE, "fonts", "Alexandria-Bold.ttf"), "start_size": 70},
+}
 
 _linebreak_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
 
@@ -119,8 +130,8 @@ def _wrap_lines(draw, text, font, max_width):
     return lines
 
 
-def _make_linebreak_font(size):
-    font = ImageFont.truetype(LINEBREAK_FONT_PATH, size)
+def _make_linebreak_font(font_path, size):
+    font = ImageFont.truetype(font_path, size)
     try:
         font.set_variation_by_name(LINEBREAK_WEIGHT)
     except OSError:
@@ -128,16 +139,23 @@ def _make_linebreak_font(size):
     return font
 
 
-def insert_line_breaks(text):
+def insert_line_breaks(text, target_lang):
     """pipeline/generate_card.py의 fit_hookline_font_by_line_count()와 동일 로직(격리
     실행 리포라 import 불가, 2026-09-25 그대로 이식 - 단 line1/line2 분리 없이 단일
-    문자열 기준). GPT가 지침 없이 반환한 한 줄 텍스트를 실제 렌더 폰트/폭 조건으로
-    2줄(기본) ~ 3줄(안 들어갈 때만)로 쪼갠다."""
+    문자열 기준). GPT가 지침 없이 반환한 한 줄 텍스트를 target_lang의 실제 렌더 폰트/폭
+    조건으로 2줄(기본) ~ 3줄(안 들어갈 때만)로 쪼갠다. LINEBREAK_PARAMS에 없는 언어는
+    원문 그대로 반환(잘못된 폰트로 쪼개는 사고 방지)."""
+    params = LINEBREAK_PARAMS.get(target_lang)
+    if not params:
+        return text
+    font_path = params["font"]
+    start_size = params["start_size"]
+
     draw = _linebreak_draw
     for target in range(LINEBREAK_PREFERRED_LINES, LINEBREAK_MAX_LINES + 1):
-        size = LINEBREAK_START_SIZE
+        size = start_size
         while size >= LINEBREAK_MIN_SIZE:
-            font = _make_linebreak_font(size)
+            font = _make_linebreak_font(font_path, size)
             lines = _wrap_lines(draw, text, font, LINEBREAK_MAX_WIDTH)
             fits_width = all(draw.textlength(ln, font=font) <= LINEBREAK_MAX_WIDTH for ln in lines)
             if len(lines) == target and fits_width:
@@ -146,9 +164,9 @@ def insert_line_breaks(text):
 
     # preferred~max 어느 목표 줄 수도 min_size까지 내려가도 정확히 안 맞으면(극단적으로
     # 길거나 짧은 문장) - 줄 수<=max_lines면 그대로 쓰는 걸로 폴백
-    size = LINEBREAK_START_SIZE
+    size = start_size
     while True:
-        font = _make_linebreak_font(size)
+        font = _make_linebreak_font(font_path, size)
         lines = _wrap_lines(draw, text, font, LINEBREAK_MAX_WIDTH)
         fits_width = all(draw.textlength(ln, font=font) <= LINEBREAK_MAX_WIDTH for ln in lines)
         if (len(lines) <= LINEBREAK_MAX_LINES and fits_width) or size <= LINEBREAK_MIN_SIZE:
@@ -317,7 +335,7 @@ def main():
                 if custom_id and text:
                     text = _abbreviate_usd_amounts(text)
                     if field == "hook":
-                        text = insert_line_breaks(text)
+                        text = insert_line_breaks(text, target_lang)
                     updates.append((custom_id, column, text))
         if updates:
             written = upsert_translate_data(contents_sheet_id, updates)
