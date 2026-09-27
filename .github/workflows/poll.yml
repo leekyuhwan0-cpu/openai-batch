@@ -7,7 +7,12 @@ on:
   # 걸 확인해서(2026-09-11) 그 착각을 부르는 촘촘한 스케줄 대신 1시간으로 낮춤.
   schedule:
     - cron: '0 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: '즉시 감지된 배치 ID (bonus_ui.py가 자동으로 채움 - 비워두면 백업 스캔 모드)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -40,6 +45,7 @@ jobs:
           GEMINI_API_KEY_7: ${{ secrets.GEMINI_API_KEY_7 }}
           GEMINI_API_KEY_8: ${{ secrets.GEMINI_API_KEY_8 }}
           GEMINI_API_KEY_9: ${{ secrets.GEMINI_API_KEY_9 }}
+          DISPATCH_BATCH_ID: ${{ github.event.inputs.batch_id }}
       # GitHub은 60일간 이 repo에 커밋(push)이 없으면 위 스케줄(cron) 자체를 자동으로
       # 꺼버린다 - "리포 활동"으로 인정되는 건 워크플로 실행이 아니라 실제 커밋이라
       # 45일에 한 번씩만 하트비트 커밋을 스스로 올려서 사람 개입 없이 영구히 살려둔다

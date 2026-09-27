@@ -442,17 +442,29 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
 
 def main():
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    now = time.time()
+    dispatch_batch_id = (os.environ.get("DISPATCH_BATCH_ID") or "").strip()
 
-    batches = [
-        b for b in client.batches.list(limit=100)
-        if now - b.created_at <= MAX_BATCH_AGE_SEC
-    ]
-    completed = [
-        b for b in batches
-        if b.status == "completed" and (b.metadata or {}).get("contents_sheet_id") and b.output_file_id
-    ]
-    print(f"최근 {MAX_BATCH_AGE_SEC // 3600}h 배치 {len(batches)}개 중 처리대상 {len(completed)}개")
+    if dispatch_batch_id:
+        # 즉시-트리거 경로: submit_translation_batch가 완료를 직접 감지해 이 배치
+        # ID 하나만 콕 집어 깨웠다 - 72h 전체 스캔/재검증 없이 이 배치 세트만 처리.
+        b = client.batches.retrieve(dispatch_batch_id)
+        if b.status != "completed" or not b.output_file_id or not (b.metadata or {}).get("contents_sheet_id"):
+            print(f"batch_id={dispatch_batch_id}: 아직 처리 불가(status={b.status}) - 종료")
+            return
+        completed = [b]
+        print(f"[즉시 처리] batch_id={dispatch_batch_id} 단건")
+    else:
+        # 백업 스캔 경로: 즉시-트리거를 놓쳤을 때만 여기로 옴(GUI 종료 등, 드묾).
+        now = time.time()
+        batches = [
+            b for b in client.batches.list(limit=100)
+            if now - b.created_at <= MAX_BATCH_AGE_SEC
+        ]
+        completed = [
+            b for b in batches
+            if b.status == "completed" and (b.metadata or {}).get("contents_sheet_id") and b.output_file_id
+        ]
+        print(f"[백업 스캔] 최근 {MAX_BATCH_AGE_SEC // 3600}h 배치 {len(batches)}개 중 처리대상 {len(completed)}개")
 
     by_sheet = {}
     for b in completed:
@@ -486,7 +498,26 @@ def main():
             continue
 
         wb, xlsx_path = download_workbook(contents_sheet_id)
-        final_updates = verify_and_correct(client, contents_sheet_id, wb, raw_updates)
+
+        # 안전망: TRANSLATE_DATA에 이미 값이 채워진 (file_id, column)은 검증 전에
+        # 제외 - 백업 스캔 경로에서 이미 처리된 배치가 섞여 들어와도 Gemini를
+        # 다시 태우지 않는다(즉시-트리거 경로는 항상 방금 완료된 배치 1개뿐이라
+        # 보통 걸릴 게 없지만, 동일하게 적용해도 무해함).
+        _, td_rows = ws_read_dicts(wb["TRANSLATE_DATA"])
+        td_by_id = {r.get("file_id"): r for r in td_rows}
+        new_updates = [
+            (cid, field, target_lang, text)
+            for (cid, field, target_lang, text) in raw_updates
+            if not (td_by_id.get(cid) or {}).get(f"{target_lang}_{field}", "").strip()
+        ]
+        skipped = len(raw_updates) - len(new_updates)
+        if skipped:
+            print(f"  {contents_sheet_id}: {len(raw_updates)}건 중 {skipped}건 이미 처리됨 - {len(new_updates)}건만 검증")
+        if not new_updates:
+            os.remove(xlsx_path)
+            continue
+
+        final_updates = verify_and_correct(client, contents_sheet_id, wb, new_updates)
         if final_updates:
             written = upsert_translate_data(wb, xlsx_path, contents_sheet_id, final_updates)
             print(f"{contents_sheet_id}: {len(final_updates)}건 확인, {written}건 신규 반영")
