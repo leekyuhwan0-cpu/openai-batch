@@ -364,6 +364,13 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
     final_updates = []
     for (target_lang, field), pairs in groups.items():
         column = f"{target_lang}_{field}"
+
+        if field != "hook":
+            # 캡션 등 hook 외 필드는 Gemini 검증 없이 GPT 원본을 바로 채택
+            # (2026-09-28: 캡션 배치가 9키 전부 소진시키는 사례 발생해 검증 대상에서 제외)
+            final_updates.extend((custom_id, column, text) for custom_id, text in pairs)
+            continue
+
         tp_row = _get_translate_prompt_row(tp_rows, category, target_lang)
         style_hint = ""
         exchange_rate = ""
