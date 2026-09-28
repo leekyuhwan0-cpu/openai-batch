@@ -508,7 +508,7 @@ def main():
         new_updates = [
             (cid, field, target_lang, text)
             for (cid, field, target_lang, text) in raw_updates
-            if not (td_by_id.get(cid) or {}).get(f"{target_lang}_{field}", "").strip()
+            if not ((td_by_id.get(cid) or {}).get(f"{target_lang}_{field}") or "").strip()
         ]
         skipped = len(raw_updates) - len(new_updates)
         if skipped:
