@@ -45,6 +45,8 @@ jobs:
           GEMINI_API_KEY_7: ${{ secrets.GEMINI_API_KEY_7 }}
           GEMINI_API_KEY_8: ${{ secrets.GEMINI_API_KEY_8 }}
           GEMINI_API_KEY_9: ${{ secrets.GEMINI_API_KEY_9 }}
+          GEMINI_API_KEY_10: ${{ secrets.GEMINI_API_KEY_10 }}
+          GEMINI_API_KEY_11: ${{ secrets.GEMINI_API_KEY_11 }}
           DISPATCH_BATCH_ID: ${{ github.event.inputs.batch_id }}
       # GitHub은 60일간 이 repo에 커밋(push)이 없으면 위 스케줄(cron) 자체를 자동으로
       # 꺼버린다 - "리포 활동"으로 인정되는 건 워크플로 실행이 아니라 실제 커밋이라

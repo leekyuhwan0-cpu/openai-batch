@@ -44,7 +44,7 @@ MAX_BATCH_AGE_SEC = 3 * 24 * 3600
 MAIN_SHEET_ID = "1IK7MbiTFJiV_ofeco9FwYs7UFY_f4QHHIDZJb7T_4-o"
 
 GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_KEYS = [os.environ[k] for k in (f"GEMINI_API_KEY_{i}" for i in range(1, 10)) if os.environ.get(k)]
+GEMINI_KEYS = [os.environ[k] for k in (f"GEMINI_API_KEY_{i}" for i in range(1, 12)) if os.environ.get(k)]
 XHIGH_MODEL = "gpt-6-luna"  # project_번역모델_확정 참고 - 후킹/캡션 둘다 이 모델로 확정운영중
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
