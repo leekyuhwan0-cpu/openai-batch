@@ -20,7 +20,7 @@ GitHub Actions에서 실행. 카드뉴스 번역 파이프라인
 
 Gemini QA 검증 레이어(2026-09-26 확정, project_번역검증_gemini_파이프라인_확정 참고):
 GPT 배치 번역 결과를 TRANSLATE_DATA에 쓰기 전에 gemini-3.8-flash로 (category,
-target_lang, field) 그룹 단위 배치검증 -> FAIL만 gpt-6-luna reasoning_effort=xhigh로
+target_lang, field) 그룹 단위 배치검증 -> FAIL만 gpt-6-luna reasoning_effort=medium로
 재번역 -> 재검증 -> 그래도 FAIL이면 gemini가 누적 실패사유를 참고해 직접 최종번역.
 poll_batches.py는 별도 레포라 bonus_model_interfaces.py/bonus_sheet_io.py를 그대로
 import할 수 없음(파일 자체가 없고, bonus_sheet_io.py는 top-level `import msvcrt`라
@@ -280,6 +280,102 @@ def get_source_text(field, custom_id, content_by_id, assets_by_local_file_id):
     return (content.get("source_caption") or "").strip() if content else None
 
 
+def build_chunk_system_prompt(tp_row, field):
+    """앱(bonus_model_interfaces._build_chunk_system_prompt)과 동일 규칙: 후킹=gpt_prompt, 캡션=
+    gpt_caption_prompt, {EXCHANGE_RATE} 치환 + {TEXT} 줄 제거. 없으면 ""."""
+    col = "gpt_prompt" if field == "hook" else "gpt_caption_prompt"
+    prompt = ((tp_row or {}).get(col) or "").strip()
+    if not prompt:
+        return ""
+    prompt = prompt.replace("{EXCHANGE_RATE}", ((tp_row or {}).get("exchange_rate") or "").strip())
+    return "\n".join(ln for ln in prompt.split("\n") if "{TEXT}" not in ln).strip()
+
+
+_CHUNK_OUTPUT_INSTRUCTION = (
+    'Return only a JSON object of the form {"results": [{"id": "<item id>", "text": "<translation>"}]} '
+    "with exactly one result per input item, using the same id. Keep line breaks inside text as \n."
+)
+
+
+def _chunk_response_format(ids):
+    return {"type": "json_schema", "json_schema": {
+        "name": "translations", "strict": True,
+        "schema": {
+            "type": "object", "additionalProperties": False, "required": ["results"],
+            "properties": {"results": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False, "required": ["id", "text"],
+                "properties": {"id": {"type": "string", "enum": list(ids)}, "text": {"type": "string"}},
+            }}},
+        },
+    }}
+
+
+def _build_single_user_message(field, text, context_caption):
+    item = {"id": "single", "text": text}
+    payload = {"items": [item]}
+    if field == "hook" and context_caption:
+        item = {"id": "single", "cid": "c", "text": text}
+        payload = {"contexts": {"c": context_caption}, "items": [item]}
+    return json.dumps(payload, ensure_ascii=False) + "\n\n" + _CHUNK_OUTPUT_INSTRUCTION
+
+
+def parse_chunk_response(content, expected_ids):
+    """앱의 parse_chunk_response와 동일 규칙: JSON 실패 -> {}, 요청에 없던 id 무시, 중복 id는 첫 값,
+    빈 text는 누락 취급."""
+    try:
+        results = json.loads(content)["results"]
+    except Exception:
+        return {}
+    expected = set(expected_ids)
+    out = {}
+    for r in results if isinstance(results, list) else []:
+        try:
+            rid, text = r["id"], (r["text"] or "").strip()
+        except Exception:
+            continue
+        if rid in expected and rid not in out and text:
+            out[rid] = text
+    return out
+
+
+def translate_single(client, system_prompt, field, text, context_caption, reasoning_effort="low"):
+    """아이템 1개짜리 청크로 개별 재호출(청크와 같은 프롬프트/스키마/파서). 실패 시 None."""
+    try:
+        resp = client.chat.completions.create(
+            model=XHIGH_MODEL,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": _build_single_user_message(field, text, context_caption)}],
+            response_format=_chunk_response_format(["single"]),
+            reasoning_effort=reasoning_effort,
+        )
+        return parse_chunk_response(resp.choices[0].message.content or "", ["single"]).get("single")
+    except Exception as e:
+        print(f"    개별 재호출 실패: {e}")
+        return None
+
+
+def get_context_caption(custom_id, content_by_id, assets_by_local_file_id):
+    asset = assets_by_local_file_id.get(custom_id)
+    content = content_by_id.get(asset.get("content_id")) if asset else None
+    return (content.get("source_caption") or "").strip() if content else ""
+
+
+def chunk_expected_ids(client, batch):
+    """청크 배치의 input 파일에서 청크별 요청 id(response_format enum)를 복원. -> {chunk custom_id: [ids]}"""
+    out = {}
+    text = client.files.content(batch.input_file_id).text
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        req = json.loads(line)
+        try:
+            enum = req["body"]["response_format"]["json_schema"]["schema"]["properties"]["results"]["items"]["properties"]["id"]["enum"]
+        except (KeyError, TypeError):
+            enum = []
+        out[req.get("custom_id")] = list(enum)
+    return out
+
+
 def _gemini_call(payload):
     """9키 로테이션: 429(한도소진)면 다음 키로, 500/503(일시장애)이면 같은 키로 백오프
     재시도. 전부 실패하면 None(호출부가 검증 없이 원본 채택하도록)."""
@@ -369,8 +465,8 @@ def _gemini_verify(items, style_hint, exchange_rate, field):
 
 
 def _gemini_translate_fallback(source_text, attempts, reasons, style_hint, exchange_rate, field, target_lang):
-    """xhigh 재번역까지 FAIL난 항목의 최종 수단: gemini가 누적 실패사유를 컨텍스트로
-    받아 직접 최종번역까지 수행. Returns: str 또는 실패 시 None(호출부가 xhigh 재번역
+    """medium 재번역까지 FAIL난 항목의 최종 수단: gemini가 누적 실패사유를 컨텍스트로
+    받아 직접 최종번역까지 수행. Returns: str 또는 실패 시 None(호출부가 medium 재번역
     결과를 그대로 채택하도록)."""
     field_label = "짧은 후킹 문구(제목형)" if field == "hook" else "본문(캡션)"
     rule_text = style_hint.replace("{EXCHANGE_RATE}", exchange_rate).replace("{TEXT}", source_text)
@@ -398,19 +494,24 @@ def _gemini_translate_fallback(source_text, attempts, reasons, style_hint, excha
         return None
 
 
-def _gpt_retry_xhigh(client, style_hint, exchange_rate, source_text):
-    prompt = style_hint.replace("{EXCHANGE_RATE}", exchange_rate).replace("{TEXT}", source_text)
+def _gpt_retry_medium(client, system_prompt, field, source_text, context_caption=""):
+    """FAIL난 항목을 같은 시스템 프롬프트/스키마(아이템 1개 청크)로 medium 재번역. 실패 시 예외."""
     resp = client.chat.completions.create(
         model=XHIGH_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        reasoning_effort="xhigh",
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": _build_single_user_message(field, source_text, context_caption)}],
+        response_format=_chunk_response_format(["single"]),
+        reasoning_effort="medium",
     )
-    return (resp.choices[0].message.content or "").strip()
+    text = parse_chunk_response(resp.choices[0].message.content or "", ["single"]).get("single")
+    if not text:
+        raise RuntimeError("medium 응답 파싱 실패/빈 결과")
+    return text
 
 
 def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
     """raw_updates: [(custom_id, field, target_lang, text), ...] (GPT 배치 원본 결과).
-    (category, target_lang, field) 그룹별로 gemini-3.8-flash 검증 -> FAIL만 xhigh
+    (category, target_lang, field) 그룹별로 gemini-3.8-flash 검증 -> FAIL만 medium
     재번역 -> 재검증 -> 그래도 FAIL이면 gemini 최종번역. Returns: [(custom_id, column,
     value), ...] (upsert_translate_data에 바로 넘길 최종 형태)."""
     content_by_id, assets_by_local_file_id = build_source_lookup(wb)
@@ -432,11 +533,10 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
             continue
 
         tp_row = _get_translate_prompt_row(tp_rows, category, target_lang)
-        style_hint = ""
-        exchange_rate = ""
-        if tp_row:
-            style_hint = ((tp_row.get("style_hint") if field == "hook" else tp_row.get("caption_style_hint")) or "").strip()
-            exchange_rate = (tp_row.get("exchange_rate") or "").strip()
+        # 2026-10-04: 검증 기준 지침도 번역에 쓴 gpt_prompt(style_hint는 v1용이라 읽지 않음)
+        style_hint = ((tp_row or {}).get("gpt_prompt") or "").strip()
+        exchange_rate = ((tp_row or {}).get("exchange_rate") or "").strip()
+        system_prompt = build_chunk_system_prompt(tp_row, field)
 
         verify_items = []
         for idx, (custom_id, text) in enumerate(pairs):
@@ -445,12 +545,13 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
                 print(f"  경고: custom_id={custom_id} 원문 조회 실패 - 검증 없이 원본 채택")
                 final_updates.append((custom_id, column, text))
                 continue
-            verify_items.append({"id": idx, "custom_id": custom_id, "source": source_text, "translated": text})
+            verify_items.append({"id": idx, "custom_id": custom_id, "source": source_text, "translated": text,
+                                 "context": get_context_caption(custom_id, content_by_id, assets_by_local_file_id)})
 
         if not verify_items:
             continue
         if not style_hint:
-            print(f"  경고: category={category!r} lang={target_lang!r} field={field!r} style_hint 없음 - 검증 스킵")
+            print(f"  경고: category={category!r} lang={target_lang!r} field={field!r} gpt_prompt 없음 - 검증 스킵")
             final_updates.extend((it["custom_id"], column, it["translated"]) for it in verify_items)
             continue
 
@@ -473,14 +574,14 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
         if not fail_items:
             print(f"  category={category} lang={target_lang} field={field}: {len(verify_items)}건 전부 PASS")
             continue
-        print(f"  category={category} lang={target_lang} field={field}: {len(fail_items)}건 FAIL - xhigh 재번역")
+        print(f"  category={category} lang={target_lang} field={field}: {len(fail_items)}건 FAIL - medium 재번역")
 
         retry_items = []
         for it in fail_items:
             try:
-                retried = _gpt_retry_xhigh(client, style_hint, exchange_rate, it["source"])
+                retried = _gpt_retry_medium(client, system_prompt, field, it["source"], it["context"])
             except Exception as e:
-                print(f"    xhigh 재번역 실패(custom_id={it['custom_id']}): {e}")
+                print(f"    medium 재번역 실패(custom_id={it['custom_id']}): {e}")
                 final_updates.append((it["custom_id"], column, it["translated"]))
                 continue
             retry_items.append(dict(it, retried=retried))
@@ -497,7 +598,7 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
             if reverify_results is None or r is None or r.get("verdict") == "PASS":
                 final_updates.append((it["custom_id"], column, it["retried"]))
                 continue
-            print(f"    custom_id={it['custom_id']}: xhigh 재번역도 FAIL - gemini 최종번역 시도")
+            print(f"    custom_id={it['custom_id']}: medium 재번역도 FAIL - gemini 최종번역 시도")
             fallback = _gemini_translate_fallback(
                 it["source"], [it["translated"], it["retried"]], [it["reason"], r.get("reason", "")],
                 style_hint, exchange_rate, field, target_lang,
@@ -539,18 +640,38 @@ def main():
 
     for contents_sheet_id, sheet_batches in by_sheet.items():
         raw_updates = []  # (custom_id, field, target_lang, text) - 검증 전 GPT 원본
+        missing = []  # 청크 응답에서 누락/파싱실패한 (id, field, target_lang, category) - 개별 재호출 대상
         for b in sheet_batches:
             field = b.metadata.get("field")
             target_lang = b.metadata.get("target_lang")
             if not field or not target_lang:
                 continue
+            is_chunk = b.metadata.get("mode") == "chunk"
+            expected_by_chunk = chunk_expected_ids(client, b) if is_chunk else {}
             content = client.files.content(b.output_file_id).text
+            seen_chunks = set()
             for line in content.splitlines():
                 if not line.strip():
                     continue
                 row = json.loads(line)
                 custom_id = row.get("custom_id")
                 resp = row.get("response") or {}
+                if is_chunk:
+                    seen_chunks.add(custom_id)
+                    expected = expected_by_chunk.get(custom_id, [])
+                    msg = ""
+                    if resp.get("status_code") == 200:
+                        try:
+                            msg = resp["body"]["choices"][0]["message"]["content"] or ""
+                        except (KeyError, IndexError, TypeError):
+                            msg = ""
+                    parsed = parse_chunk_response(msg, expected)
+                    for rid in expected:
+                        if rid in parsed:
+                            raw_updates.append((rid, field, target_lang, parsed[rid]))
+                        else:
+                            missing.append((rid, field, target_lang, b.metadata.get("category") or ""))
+                    continue
                 if resp.get("status_code") != 200:
                     print(f"  경고: batch={b.id} custom_id={custom_id} 응답 실패, 건너뜀")
                     continue
@@ -560,9 +681,15 @@ def main():
                     continue
                 if custom_id and text:
                     raw_updates.append((custom_id, field, target_lang, text))
+            if is_chunk:
+                # output에 아예 없는 청크(만료/에러파일행)도 누락 처리
+                for cid_, ids in expected_by_chunk.items():
+                    if cid_ not in seen_chunks:
+                        missing.extend((rid, field, target_lang, b.metadata.get("category") or "") for rid in ids)
 
-        if not raw_updates:
+        if not raw_updates and not missing:
             continue
+
 
         wb, xlsx_path = download_workbook(contents_sheet_id)
 
@@ -572,6 +699,29 @@ def main():
         # 보통 걸릴 게 없지만, 동일하게 적용해도 무해함).
         _, td_rows = ws_read_dicts(wb["TRANSLATE_DATA"])
         td_by_id = {r.get("file_id"): r for r in td_rows}
+
+        if missing:
+            content_by_id, assets_by_local_file_id = build_source_lookup(wb)
+            tp_rows, category_by_sheet_id = _load_main_lookups()
+            print(f"  {contents_sheet_id}: 청크 응답 누락/실패 {len(missing)}건 - 개별 재호출")
+            for rid, field, target_lang, cat in missing:
+                if ((td_by_id.get(rid) or {}).get(f"{target_lang}_{field}") or "").strip():
+                    continue  # 이미 채워져 있음
+                tp_row = _get_translate_prompt_row(tp_rows, cat or category_by_sheet_id.get(contents_sheet_id), target_lang)
+                system_prompt = build_chunk_system_prompt(tp_row, field)
+                src = get_source_text(field, rid, content_by_id, assets_by_local_file_id)
+                if not system_prompt or not src:
+                    print(f"    id={rid}: 프롬프트/원문 없음 - 쓰지 않음(최종저장에서 차단됨)")
+                    continue
+                ctx = get_context_caption(rid, content_by_id, assets_by_local_file_id) if field == "hook" else ""
+                text = translate_single(client, system_prompt, field, src, ctx)
+                if text:
+                    raw_updates.append((rid, field, target_lang, text))
+                else:
+                    print(f"    id={rid}: 개별 재호출도 실패 - 쓰지 않음(최종저장에서 차단됨)")
+        if not raw_updates:
+            os.remove(xlsx_path)
+            continue
         new_updates = [
             (cid, field, target_lang, text)
             for (cid, field, target_lang, text) in raw_updates
