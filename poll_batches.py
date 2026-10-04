@@ -138,32 +138,92 @@ def ws_write_dicts(ws, headers, dict_rows):
         ws.append([row.get(h, "") for h in headers])
 
 
+SHEETS_API_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+
+def _col_letter(idx0):
+    n = idx0 + 1
+    out = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
+def _sheet_values(contents_sheet_id, tab):
+    """탭 전체를 Sheets API로 지금 시점 그대로 읽는다. -> (headers, [(시트행번호, dict), ...])"""
+    from urllib.parse import quote
+    r = _request_with_retry("GET", f"{SHEETS_API_BASE}/{contents_sheet_id}/values/{quote(tab)}")
+    values = r.json().get("values") or []
+    if not values:
+        return [], []
+    headers = values[0]
+    rows = []
+    for i, row in enumerate(values[1:], start=2):
+        if not any(str(v).strip() for v in row):
+            continue
+        rows.append((i, {headers[j]: row[j] for j in range(len(headers)) if j < len(row)}))
+    return headers, rows
+
+
 def upsert_translate_data(wb, xlsx_path, contents_sheet_id, updates):
-    """updates: [(file_id, column, value), ...]. pipeline/bonus_ui.py의
-    persist_fields_batch와 동일한 upsert 규칙(행이 없으면 새로 만든다) +
-    이미 채워진 셀은 덮어쓰지 않는 멱등성 체크. wb/xlsx_path는 호출부가 CONTENTS/ASSETS
-    조회에 이미 쓴 것과 같은 다운로드를 그대로 넘겨받는다(같은 워크북 중복 다운로드
-    방지, 2026-09-26 Gemini 검증 레이어 추가하며 리팩터링). Returns: written_count."""
-    ws = wb["TRANSLATE_DATA"]
-    headers, rows = ws_read_dicts(ws)
-    by_file_id = {r.get("file_id"): r for r in rows}
-    written = 0
-    for file_id, column, value in updates:
-        r = by_file_id.get(file_id)
-        if r is None:
-            r = {h: "" for h in headers}
-            r["file_id"] = file_id
-            rows.append(r)
-            by_file_id[file_id] = r
-        if (r.get(column) or "").strip():
-            continue  # 이미 채워져 있음 - 덮어쓰지 않음(멱등성)
-        r[column] = value
-        written += 1
-    if written:
-        ws_write_dicts(ws, headers, rows)
-        upload_workbook(wb, xlsx_path, contents_sheet_id)
-    else:
+    """updates: [(file_id, column, value), ...]. Returns: written_count.
+
+    2026-10-04: 워크북 통째 업로드 방식 폐기 -> 셀 단위 Sheets API. 예전 방식은 (1) 배치
+    완료~Gemini 검증이 끝날 때까지 들고 있던 오래된 사본으로 TRANSLATE_DATA 탭을 통째로
+    덮어써서 그 사이 앱에서 삭제한 콘텐츠(CONTENTS/ASSETS 행 포함)를 되살릴 수 있었고,
+    (2) 삭제된 콘텐츠의 늦게 도착한 결과가 TRANSLATE_DATA 맨 아래에 고아 행으로 새로
+    생겼다(603번). 이제 쓰기 직전에 TRANSLATE_DATA/ASSETS를 새로 읽어 (a) ASSETS에
+    실존하는 file_id만 쓰고 (b) 기존 행은 비어 있는 셀만 채우고 (c) 새 행은 append한다.
+    wb/xlsx_path는 호출부 시그니처 호환용 - 더 이상 업로드하지 않고 임시파일만 지운다."""
+    try:
         os.remove(xlsx_path)
+    except OSError:
+        pass
+    headers, rows = _sheet_values(contents_sheet_id, "TRANSLATE_DATA")
+    _, asset_rows = _sheet_values(contents_sheet_id, "ASSETS")
+    alive = {str(r.get("local_file_id")) for _, r in asset_rows}
+    col_idx = {h: i for i, h in enumerate(headers)}
+    by_file_id = {str(r.get("file_id")): (rn, r) for rn, r in rows}
+
+    cell_updates = []
+    new_rows = {}
+    written = 0
+    dropped = 0
+    for file_id, column, value in updates:
+        if str(file_id) not in alive:
+            dropped += 1
+            continue
+        if column not in col_idx:
+            raise ValueError(f"TRANSLATE_DATA 헤더에 '{column}' 없음")
+        hit = by_file_id.get(str(file_id))
+        if hit is not None:
+            rn, r = hit
+            if (r.get(column) or "").strip():
+                continue  # 이미 채워져 있음 - 덮어쓰지 않음(멱등성)
+            cell_updates.append((f"TRANSLATE_DATA!{_col_letter(col_idx[column])}{rn}", value))
+            r[column] = value
+            written += 1
+        else:
+            nr = new_rows.setdefault(str(file_id), {h: "" for h in headers})
+            nr["file_id"] = str(file_id)
+            if not (nr.get(column) or "").strip():
+                nr[column] = value
+                written += 1
+    if dropped:
+        print(f"  경고: ASSETS에 없는(삭제된) file_id {dropped}건은 쓰지 않음")
+    if cell_updates:
+        _request_with_retry(
+            "POST", f"{SHEETS_API_BASE}/{contents_sheet_id}/values:batchUpdate",
+            json={"valueInputOption": "RAW",
+                  "data": [{"range": a1, "values": [[v]]} for a1, v in cell_updates]},
+        )
+    if new_rows:
+        _request_with_retry(
+            "POST", f"{SHEETS_API_BASE}/{contents_sheet_id}/values/TRANSLATE_DATA:append",
+            params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+            json={"values": [[r.get(h, "") for h in headers] for r in new_rows.values()]},
+        )
     return written
 
 
