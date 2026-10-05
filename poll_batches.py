@@ -21,7 +21,7 @@ GitHub Actions에서 실행. 카드뉴스 번역 파이프라인
 Gemini QA 검증 레이어(2026-09-26 확정, project_번역검증_gemini_파이프라인_확정 참고):
 GPT 배치 번역 결과를 TRANSLATE_DATA에 쓰기 전에 gemini-3.8-flash로 (category,
 target_lang, field) 그룹 단위 배치검증 -> FAIL만 gpt-6-luna reasoning_effort=medium로
-재번역 -> 재검증 -> 그래도 FAIL이면 gemini가 누적 실패사유를 참고해 직접 최종번역.
+재번역 -> 재검증 -> 그래도 FAIL이면 해당 칸에 "[번역실패]" 표식(2026-10-05 개정, Vertex 사용).
 poll_batches.py는 별도 레포라 bonus_model_interfaces.py/bonus_sheet_io.py를 그대로
 import할 수 없음(파일 자체가 없고, bonus_sheet_io.py는 top-level `import msvcrt`라
 Linux 러너에서 죽음) - 그래서 TRANSLATE_PROMPTS/SOURCE_ACCOUNTS 조회도 이 파일 안의
@@ -30,6 +30,7 @@ download_workbook/ws_read_dicts를 그대로 재사용해 MAIN_SHEET_ID를 직�
 """
 import json
 import os
+import re
 import time
 import uuid
 
@@ -44,7 +45,9 @@ MAX_BATCH_AGE_SEC = 3 * 24 * 3600
 MAIN_SHEET_ID = "1IK7MbiTFJiV_ofeco9FwYs7UFY_f4QHHIDZJb7T_4-o"
 
 GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_KEYS = [os.environ[k] for k in (f"GEMINI_API_KEY_{i}" for i in range(1, 12)) if os.environ.get(k)]
+VERTEX_API_KEY = os.environ.get("VERTEX_API_KEY", "")
+VERTEX_URL = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{GEMINI_MODEL}:generateContent"
+VERIFY_WORKERS = 4
 XHIGH_MODEL = "gpt-6-luna"  # project_번역모델_확정 참고 - 후킹/캡션 둘다 이 모델로 확정운영중
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
@@ -377,121 +380,112 @@ def chunk_expected_ids(client, batch):
 
 
 def _gemini_call(payload):
-    """9키 로테이션: 429(한도소진)면 다음 키로, 500/503(일시장애)이면 같은 키로 백오프
-    재시도. 전부 실패하면 None(호출부가 검증 없이 원본 채택하도록)."""
-    if not GEMINI_KEYS:
-        print("  경고: GEMINI_API_KEY_1~9 중 설정된 키가 없음 - 검증 없이 원본 채택")
+    """Vertex express 호출. 429/500/503/연결오류는 백오프 재시도(최대 4회). 전부 실패하면 None
+    (호출부가 GPT 원본을 그대로 채택하고 로그만 남김)."""
+    if not VERTEX_API_KEY:
+        print("  경고: VERTEX_API_KEY 없음 - 검증 없이 원본 채택")
         return None
-    for key_idx, api_key in enumerate(GEMINI_KEYS):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-        for attempt in range(1, 4):
-            try:
-                resp = requests.post(url, json=payload, timeout=180)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                time.sleep(5)
-                continue
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 429:
-                print(f"  Gemini key#{key_idx + 1} 429(한도소진) - 다음 키로 전환")
-                break
-            if resp.status_code in (500, 503):
-                time.sleep(5 * attempt)
-                continue
-            print(f"  Gemini key#{key_idx + 1} HTTP {resp.status_code}: {resp.text[:200]}")
-            break
-    print("  경고: Gemini 호출 9키 전부 실패 - 검증 없이 원본 채택")
+    for attempt in range(1, 5):
+        try:
+            resp = requests.post(VERTEX_URL, params={"key": VERTEX_API_KEY}, json=payload, timeout=180)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            time.sleep(4 * attempt)
+            continue
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in (429, 500, 503):
+            time.sleep(4 * attempt)
+            continue
+        print(f"  Vertex HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+    print("  경고: Vertex 호출 재시도 소진 - 해당 청크는 검증 없이 원본 채택")
     return None
 
+
+# 2026-10-05: 검증 재설계 - 스타일/품질은 보지 않고 (1)금액 환산 (2)숫자 오류 (3)원본통화 잔존
+# (4)미번역만 본다. 지침은 코드가 아니라 TRANSLATE_PROMPTS.verify_prompt(시트)에서 읽는다.
+VERIFY_CHUNK = 20          # GPT 번역 청크(20개)와 동일 단위
+FAIL_MARK = "[번역실패]"    # 재번역까지 실패한 칸에 쓰는 표식(앱이 빨간색으로 표시)
+
+LANG_NAMES = {
+    "kr": "한국어", "ja": "일본어", "de": "독일어", "tr": "터키어", "en": "영어", "es": "스페인어",
+    "fr": "프랑스어", "it": "이탈리아어", "nl": "네덜란드어", "se": "스웨덴어", "dk": "덴마크어", "no": "노르웨이어",
+}
 
 _VERIFY_SCHEMA = {
     "type": "ARRAY",
     "items": {
         "type": "OBJECT",
-        "properties": {
-            "id": {"type": "INTEGER"},
-            "meaning": {"type": "STRING", "enum": ["accurate", "partial_loss", "distorted", "added"]},
-            "numbers_names": {"type": "STRING", "enum": ["all_correct", "partial_error", "error"]},
-            "subject_object": {"type": "STRING", "enum": ["same", "uncertain", "different"]},
-            "verdict": {"type": "STRING", "enum": ["PASS", "FAIL"]},
-            "reason": {"type": "STRING"},
-        },
-        "required": ["id", "meaning", "numbers_names", "subject_object", "verdict", "reason"],
+        "properties": {"id": {"type": "INTEGER"}, "reason": {"type": "STRING"}},
+        "required": ["id", "reason"],
     },
 }
 
+_TARGET_SCRIPT = {
+    "kr": re.compile(r"[가-힣]"),
+    "ja": re.compile(r"[぀-ヿ一-鿿]"),
+}
 
-def _gemini_verify(items, style_hint, exchange_rate, field):
-    """items: [{"id": int, "source": str, "translated": str}, ...], 같은
-    (category, target_lang, field) 그룹 전체를 한 번에 검증(gemini_test6_ctx.py로
-    100건 규모까지 검증된 패턴 그대로 재사용). Returns: {id: {verdict, reason, ...}}
-    또는 실패 시 None."""
-    field_label = "짧은 후킹 문구(제목형)" if field == "hook" else "본문(캡션)"
-    rule_text = style_hint.replace("{EXCHANGE_RATE}", exchange_rate).replace(
-        "{TEXT}", "(실제 번역대상 텍스트는 아래 검증항목에 개별 포함됨)"
-    )
-    context_text = f"### 번역 시 실제로 GPT에게 주어진 지침 ###\n{rule_text}"
-    lines = [f"[id={it['id']}]\n원문: {it['source']}\n번역: {it['translated']}" for it in items]
-    body_text = "\n\n".join(lines)
-    prompt = f"""아래는 번역 시 실제로 사용된 스타일/화폐표기 지침이다. 이 지침에 맞게 작성된 번역은 정상으로 간주하고, 이 지침을 벗어난 경우만 오류로 판단하라.
+def looks_untranslated(source, translated, target_lang):
+    """코드 미번역 판별(Gemini와 2중 필터) - kr/ja 전용. 타겟 문자가 없거나 라틴 문자가 타겟
+    문자보다 많으면 미번역. 다른 언어는 Gemini에만 맡기므로 항상 False."""
+    pat = _TARGET_SCRIPT.get(target_lang)
+    if pat is None:
+        return False
+    t = (translated or "").strip()
+    if not t:
+        return True
+    n_target = len(pat.findall(t))
+    n_latin = len(re.findall(r"[A-Za-zÀ-ÿĞğİıŞş]", t))
+    return n_target == 0 or n_latin > n_target
 
-{context_text}
 
-===
+def build_verify_prompt(vp_row, target_lang):
+    """verify_prompt(시트) + {TARGET_LANG}/{EXCHANGE_RATE} 치환. 없으면 ""."""
+    prompt = ((vp_row or {}).get("verify_prompt") or "").strip()
+    if not prompt:
+        return ""
+    return (prompt.replace("{TARGET_LANG}", LANG_NAMES.get(target_lang, target_lang))
+                  .replace("{EXCHANGE_RATE}", ((vp_row or {}).get("exchange_rate") or "").strip()))
 
-위 지침을 참고해서, 다음 (원문, 번역) 쌍 {len(items)}개의 번역 품질을 채점하라. 원문은 인스타그램 카드뉴스용 {field_label}이다.
 
-- meaning: accurate / partial_loss / distorted / added
-- numbers_names: all_correct / partial_error / error (단, 위 지침에 명시된 화폐 축약/반올림 표기는 오류로 치지 않는다)
-- subject_object: same / uncertain / different
-- verdict: PASS / FAIL (위 3개 중 하나라도 문제있으면 FAIL)
-- reason: FAIL일 때만 간단히 한 문장 (PASS면 빈 문자열)
-
-{body_text}
-"""
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "responseSchema": _VERIFY_SCHEMA},
-    }
-    data = _gemini_call(payload)
+def _gemini_verify(verify_prompt, items):
+    """items: [{"id": int, "content_id", "field", "source", "translated"}, ...] (<=VERIFY_CHUNK).
+    Returns: {id: reason} (FAIL 항목만, 전부 PASS면 {}) 또는 호출/파싱 실패 시 None."""
+    lines = [f"[id={it['id']}] (콘텐츠={it.get('content_id')}, 종류={'후킹' if it['field'] == 'hook' else '캡션'})\n"
+             f"원문: {it['source']}\n번역: {it['translated']}" for it in items]
+    prompt = f"{verify_prompt}\n\n===\n\n[검수 항목 {len(items)}개]\n\n" + "\n\n".join(lines)
+    data = _gemini_call({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "responseSchema": _VERIFY_SCHEMA,
+                             "thinkingConfig": {"thinkingBudget": 0}},
+    })
     if data is None:
         return None
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return {p["id"]: p for p in json.loads(text)}
+        text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
+        return {p["id"]: p.get("reason", "") for p in json.loads(text)}
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        print(f"  경고: Gemini 검증 응답 파싱 실패({e}) - 검증 없이 원본 채택")
+        print(f"  경고: Gemini 검증 응답 파싱 실패({e})")
         return None
 
 
-def _gemini_translate_fallback(source_text, attempts, reasons, style_hint, exchange_rate, field, target_lang):
-    """medium 재번역까지 FAIL난 항목의 최종 수단: gemini가 누적 실패사유를 컨텍스트로
-    받아 직접 최종번역까지 수행. Returns: str 또는 실패 시 None(호출부가 medium 재번역
-    결과를 그대로 채택하도록)."""
-    field_label = "짧은 후킹 문구(제목형)" if field == "hook" else "본문(캡션)"
-    rule_text = style_hint.replace("{EXCHANGE_RATE}", exchange_rate).replace("{TEXT}", source_text)
-    history = "\n".join(
-        f"- 시도 {i + 1}: \"{t}\" -> 검증 실패사유: {r}" for i, (t, r) in enumerate(zip(attempts, reasons))
-    )
-    prompt = f"""다음은 인스타그램 카드뉴스용 {field_label} 번역 지침이다. 이 지침에 따라 아래 원문을 target_lang={target_lang}로 직접 번역하라.
-
-{rule_text}
-
-===
-
-원문: {source_text}
-
-앞서 GPT가 이 원문을 번역 시도했으나 모두 검증에서 실패했다. 실패 이력:
-{history}
-
-위 실패 원인들을 반드시 피해서, 정확하고 자연스러운 최종 번역문 하나만 출력하라. 다른 설명 없이 번역문 텍스트만 출력할 것."""
-    data = _gemini_call({"contents": [{"parts": [{"text": prompt}]}]})
-    if data is None:
-        return None
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError, TypeError):
-        return None
+def _verify_in_chunks(verify_prompt, items):
+    """VERIFY_CHUNK개씩 끊어 VERIFY_WORKERS개 병렬 검증. Returns: (fails {id: reason}, unverified_ids set)."""
+    from concurrent.futures import ThreadPoolExecutor
+    chunks = [items[i:i + VERIFY_CHUNK] for i in range(0, len(items), VERIFY_CHUNK)]
+    fails, unverified = {}, set()
+    if not chunks:
+        return fails, unverified
+    with ThreadPoolExecutor(VERIFY_WORKERS) as ex:
+        results = list(ex.map(lambda c: _gemini_verify(verify_prompt, c), chunks))
+    for chunk, res in zip(chunks, results):
+        if res is None:
+            unverified.update(it["id"] for it in chunk)
+            continue
+        ids = {it["id"] for it in chunk}
+        fails.update({k: v for k, v in res.items() if k in ids})
+    return fails, unverified
 
 
 def _gpt_retry_medium(client, system_prompt, field, source_text, context_caption=""):
@@ -509,102 +503,106 @@ def _gpt_retry_medium(client, system_prompt, field, source_text, context_caption
     return text
 
 
+def verify_lang_group(client, tp_row, target_lang, items, events=None):
+    """한 타겟 언어의 번역 항목 전체(후킹+캡션)를 검증/교정한다.
+    흐름: Gemini 검증(+kr/ja 코드 미번역 판별) -> FAIL은 GPT medium 재번역 -> 재검증 ->
+    통과면 적용, 또 FAIL이면 FAIL_MARK. Gemini 호출 자체가 실패한 항목은 GPT 원본 유지(로그만).
+    items: [{"custom_id","field","content_id","source","translated","context"}, ...]
+    Returns: [(custom_id, field, value), ...]. events: 테스트/로그용 (custom_id, field, 종류, 상세) 리스트."""
+    def ev(it, kind, detail=""):
+        print(f"    [{kind}] {it['custom_id']} {it['field']} {detail[:120]}")
+        if events is not None:
+            events.append((it["custom_id"], it["field"], kind, detail))
+
+    sys_prompts = {f: build_chunk_system_prompt(tp_row, f) for f in ("hook", "caption")}
+    verify_prompt = build_verify_prompt(tp_row, target_lang)
+    if not verify_prompt:
+        print(f"  경고: lang={target_lang!r} verify_prompt 없음 - Gemini 검증 스킵(kr/ja 코드검사만 수행)")
+
+    final = {(it["custom_id"], it["field"]): it["translated"] for it in items}
+
+    # 원문이 비었거나 "-"인 항목은 검증 대상 아님
+    targets = [it for it in items if (it["source"] or "").strip() not in ("", "-")]
+    targets.sort(key=lambda x: (str(x.get("content_id")), x["custom_id"], x["field"]))
+    for n, it in enumerate(targets):
+        it["id"] = n
+
+    # 1) Gemini 검증 + 코드 미번역 판별
+    if verify_prompt and targets:
+        fails, unverified = _verify_in_chunks(verify_prompt, targets)
+    else:
+        fails, unverified = {}, set()
+    for it in targets:
+        if it["id"] in unverified:
+            ev(it, "검증불가", "Vertex 실패 - GPT 원본 유지")
+        if it["id"] in fails:
+            ev(it, "FAIL", fails[it["id"]])
+        if looks_untranslated(it["source"], it["translated"], target_lang):
+            if it["id"] not in fails:
+                ev(it, "미번역(코드)", it["translated"][:40])
+            fails[it["id"]] = fails.get(it["id"]) or "미번역(코드 판별)"
+
+    # 2) FAIL -> medium 재번역
+    retried = []
+    for it in (t for t in targets if t["id"] in fails):
+        try:
+            t = _gpt_retry_medium(client, sys_prompts[it["field"]], it["field"], it["source"], it["context"])
+        except Exception as e:
+            print(f"    medium 재번역 실패(custom_id={it['custom_id']}): {e}")
+            ev(it, "번역실패", "재번역 호출 실패")
+            final[(it["custom_id"], it["field"])] = FAIL_MARK
+            continue
+        retried.append(dict(it, translated=t))
+
+    # 3) 재검증 -> 통과면 적용, FAIL이면 표식
+    for n, it in enumerate(retried):
+        it["id"] = n
+    if verify_prompt and retried:
+        refails, reunv = _verify_in_chunks(verify_prompt, retried)
+    else:
+        refails, reunv = {}, set()
+    for it in retried:
+        key = (it["custom_id"], it["field"])
+        code_bad = looks_untranslated(it["source"], it["translated"], target_lang)
+        if it["id"] in refails or code_bad:
+            ev(it, "번역실패", refails.get(it["id"]) or "재번역도 미번역(코드)")
+            final[key] = FAIL_MARK
+        else:
+            if it["id"] in reunv:
+                ev(it, "재검증불가", "재번역본 미검증 적용")
+            ev(it, "재번역 통과", it["translated"][:60])
+            final[key] = it["translated"]
+    return [(cid, field, v) for (cid, field), v in final.items()]
+
+
 def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
     """raw_updates: [(custom_id, field, target_lang, text), ...] (GPT 배치 원본 결과).
-    (category, target_lang, field) 그룹별로 gemini-3.8-flash 검증 -> FAIL만 medium
-    재번역 -> 재검증 -> 그래도 FAIL이면 gemini 최종번역. Returns: [(custom_id, column,
+    언어별로 후킹+캡션을 함께 verify_lang_group으로 검증/교정. Returns: [(custom_id, column,
     value), ...] (upsert_translate_data에 바로 넘길 최종 형태)."""
     content_by_id, assets_by_local_file_id = build_source_lookup(wb)
     tp_rows, category_by_sheet_id = _load_main_lookups()
     category = category_by_sheet_id.get(contents_sheet_id)
 
-    groups = {}
-    for custom_id, field, target_lang, text in raw_updates:
-        groups.setdefault((target_lang, field), []).append((custom_id, text))
-
+    by_lang = {}
     final_updates = []
-    for (target_lang, field), pairs in groups.items():
-        column = f"{target_lang}_{field}"
-
-        if field != "hook":
-            # 캡션 등 hook 외 필드는 Gemini 검증 없이 GPT 원본을 바로 채택
-            # (2026-09-28: 캡션 배치가 9키 전부 소진시키는 사례 발생해 검증 대상에서 제외)
-            final_updates.extend((custom_id, column, text) for custom_id, text in pairs)
+    for custom_id, field, target_lang, text in raw_updates:
+        source_text = get_source_text(field, custom_id, content_by_id, assets_by_local_file_id)
+        if not source_text:
+            print(f"  경고: custom_id={custom_id} 원문 조회 실패 - 검증 없이 원본 채택")
+            final_updates.append((custom_id, f"{target_lang}_{field}", text))
             continue
+        asset = assets_by_local_file_id.get(custom_id) or {}
+        by_lang.setdefault(target_lang, []).append({
+            "custom_id": custom_id, "field": field, "content_id": asset.get("content_id"),
+            "source": source_text, "translated": text,
+            "context": get_context_caption(custom_id, content_by_id, assets_by_local_file_id)})
 
+    for target_lang, items in by_lang.items():
         tp_row = _get_translate_prompt_row(tp_rows, category, target_lang)
-        # 2026-10-04: 검증 기준 지침도 번역에 쓴 gpt_prompt(style_hint는 v1용이라 읽지 않음)
-        style_hint = ((tp_row or {}).get("gpt_prompt") or "").strip()
-        exchange_rate = ((tp_row or {}).get("exchange_rate") or "").strip()
-        system_prompt = build_chunk_system_prompt(tp_row, field)
-
-        verify_items = []
-        for idx, (custom_id, text) in enumerate(pairs):
-            source_text = get_source_text(field, custom_id, content_by_id, assets_by_local_file_id)
-            if not source_text:
-                print(f"  경고: custom_id={custom_id} 원문 조회 실패 - 검증 없이 원본 채택")
-                final_updates.append((custom_id, column, text))
-                continue
-            verify_items.append({"id": idx, "custom_id": custom_id, "source": source_text, "translated": text,
-                                 "context": get_context_caption(custom_id, content_by_id, assets_by_local_file_id)})
-
-        if not verify_items:
-            continue
-        if not style_hint:
-            print(f"  경고: category={category!r} lang={target_lang!r} field={field!r} gpt_prompt 없음 - 검증 스킵")
-            final_updates.extend((it["custom_id"], column, it["translated"]) for it in verify_items)
-            continue
-
-        results = _gemini_verify(
-            [{"id": it["id"], "source": it["source"], "translated": it["translated"]} for it in verify_items],
-            style_hint, exchange_rate, field,
-        )
-        if results is None:
-            final_updates.extend((it["custom_id"], column, it["translated"]) for it in verify_items)
-            continue
-
-        fail_items = []
-        for it in verify_items:
-            r = results.get(it["id"])
-            if r is None or r.get("verdict") == "PASS":
-                final_updates.append((it["custom_id"], column, it["translated"]))
-            else:
-                fail_items.append(dict(it, reason=r.get("reason", "")))
-
-        if not fail_items:
-            print(f"  category={category} lang={target_lang} field={field}: {len(verify_items)}건 전부 PASS")
-            continue
-        print(f"  category={category} lang={target_lang} field={field}: {len(fail_items)}건 FAIL - medium 재번역")
-
-        retry_items = []
-        for it in fail_items:
-            try:
-                retried = _gpt_retry_medium(client, system_prompt, field, it["source"], it["context"])
-            except Exception as e:
-                print(f"    medium 재번역 실패(custom_id={it['custom_id']}): {e}")
-                final_updates.append((it["custom_id"], column, it["translated"]))
-                continue
-            retry_items.append(dict(it, retried=retried))
-
-        if not retry_items:
-            continue
-
-        reverify_results = _gemini_verify(
-            [{"id": it["id"], "source": it["source"], "translated": it["retried"]} for it in retry_items],
-            style_hint, exchange_rate, field,
-        )
-        for it in retry_items:
-            r = reverify_results.get(it["id"]) if reverify_results else None
-            if reverify_results is None or r is None or r.get("verdict") == "PASS":
-                final_updates.append((it["custom_id"], column, it["retried"]))
-                continue
-            print(f"    custom_id={it['custom_id']}: medium 재번역도 FAIL - gemini 최종번역 시도")
-            fallback = _gemini_translate_fallback(
-                it["source"], [it["translated"], it["retried"]], [it["reason"], r.get("reason", "")],
-                style_hint, exchange_rate, field, target_lang,
-            )
-            final_updates.append((it["custom_id"], column, fallback or it["retried"]))
-
+        results = verify_lang_group(client, tp_row, target_lang, items)
+        n_fail = sum(1 for _, _, v in results if v == FAIL_MARK)
+        print(f"  category={category} lang={target_lang}: {len(items)}건 검증 완료 (번역실패 {n_fail}건)")
+        final_updates.extend((cid, f"{target_lang}_{field}", v) for cid, field, v in results)
     return final_updates
 
 
