@@ -405,7 +405,7 @@ def _gemini_call(payload):
 # 2026-10-05: 검증 재설계 - 스타일/품질은 보지 않고 (1)금액 환산 (2)숫자 오류 (3)원본통화 잔존
 # (4)미번역만 본다. 지침은 코드가 아니라 TRANSLATE_PROMPTS.verify_prompt(시트)에서 읽는다.
 VERIFY_CHUNK = 20          # GPT 번역 청크(20개)와 동일 단위
-FAIL_MARK = "[번역실패]"    # 재번역까지 실패한 칸에 쓰는 표식(앱이 빨간색으로 표시)
+FAIL_MARK = "[번역실패]"    # 재번역까지 실패한 칸 앞에 붙이는 표식 "[번역실패] 실패한번역문"(앱이 빨간색으로 표시)
 
 LANG_NAMES = {
     "kr": "한국어", "ja": "일본어", "de": "독일어", "tr": "터키어", "en": "영어", "es": "스페인어",
@@ -550,7 +550,7 @@ def verify_lang_group(client, tp_row, target_lang, items, events=None):
         except Exception as e:
             print(f"    medium 재번역 실패(custom_id={it['custom_id']}): {e}")
             ev(it, "번역실패", "재번역 호출 실패")
-            final[(it["custom_id"], it["field"])] = FAIL_MARK
+            final[(it["custom_id"], it["field"])] = f"{FAIL_MARK} {it['translated']}"
             continue
         retried.append(dict(it, translated=t))
 
@@ -566,7 +566,7 @@ def verify_lang_group(client, tp_row, target_lang, items, events=None):
         code_bad = looks_untranslated(it["source"], it["translated"], target_lang)
         if it["id"] in refails or code_bad:
             ev(it, "번역실패", refails.get(it["id"]) or "재번역도 미번역(코드)")
-            final[key] = FAIL_MARK
+            final[key] = f"{FAIL_MARK} {it['translated']}"
         else:
             if it["id"] in reunv:
                 ev(it, "재검증불가", "재번역본 미검증 적용")
@@ -600,7 +600,7 @@ def verify_and_correct(client, contents_sheet_id, wb, raw_updates):
     for target_lang, items in by_lang.items():
         tp_row = _get_translate_prompt_row(tp_rows, category, target_lang)
         results = verify_lang_group(client, tp_row, target_lang, items)
-        n_fail = sum(1 for _, _, v in results if v == FAIL_MARK)
+        n_fail = sum(1 for _, _, v in results if v.startswith(FAIL_MARK))
         print(f"  category={category} lang={target_lang}: {len(items)}건 검증 완료 (번역실패 {n_fail}건)")
         final_updates.extend((cid, f"{target_lang}_{field}", v) for cid, field, v in results)
     return final_updates
