@@ -1,0 +1,45 @@
+name: OCR Presubmit
+
+on:
+  # bonus_ui.py의 "OCR 사전제출" 버튼이 workflow_dispatch로 호출 (GUI는 끄고 와도 됨)
+  workflow_dispatch:
+    inputs:
+      sheet_id:
+        description: '대상 contents 시트 ID'
+        required: true
+      id_min:
+        description: '시작 번호(local_file_id, 비우면 빈칸 전체)'
+        required: false
+        default: ''
+      id_max:
+        description: '끝 번호'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocr-${{ github.event.inputs.sheet_id }}
+  cancel-in-progress: false
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python ocr_run.py
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SHEET_ID: ${{ github.event.inputs.sheet_id }}
+          ID_MIN: ${{ github.event.inputs.id_min }}
+          ID_MAX: ${{ github.event.inputs.id_max }}
