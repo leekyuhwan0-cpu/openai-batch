@@ -1,0 +1,37 @@
+name: Viral Daily
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: '1이면 시트/Drive 기록 없이 로그만(테스트)'
+        required: false
+        default: '1'
+  # 수동 테스트 통과 후 주석 해제 (매일 06:00 KST)
+  # schedule:
+  #   - cron: '0 21 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: viral-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python viral_run.py
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          SCRAPECREATORS_API_KEY: ${{ secrets.SCRAPECREATORS_API_KEY }}
+          VIRAL_DRY: ${{ github.event.inputs.dry || '0' }}
