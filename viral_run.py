@@ -17,6 +17,7 @@ MIN_LIKES = int(os.environ.get("VIRAL_MIN_LIKES", "1000"))
 DRIVE_ROOT_ID = os.environ.get("VIRAL_DRIVE_ROOT_ID", "")
 DRIVE_ROOT_NAME = "바이럴수집"
 MAX_PAGES = 3
+PIN_SLOTS = 4  # 상단 고정글 자리(ac미디어는 맨 위 4개가 옛날 글이었음)
 KST = dt.timezone(dt.timedelta(hours=9))
 DRY = os.environ.get("VIRAL_DRY") == "1"  # 1이면 시트 기록/Drive 업로드 없이 로그만
 DRIVE = "https://www.googleapis.com/drive/v3/files"
@@ -45,7 +46,7 @@ def write_cells(updates):
 def fetch_posts(handle, y_start, y_end):
     """어제(KST) 게시물. 상단 고정 최대 3개 때문에 index>=3에서 어제 이전 글이 나오면 중단."""
     out, cursor = [], None
-    for _ in range(MAX_PAGES):
+    for page in range(MAX_PAGES):
         params = {"handle": handle}
         if cursor:
             params["cursor"] = cursor
@@ -54,13 +55,18 @@ def fetch_posts(handle, y_start, y_end):
             raise RuntimeError(f"HTTP {r.status_code} {r.text[:150]}")
         d = r.json()
         items = d.get("items") or []
-        stop = False
+        stop, run = False, 0
         for i, it in enumerate(items):
             t = it.get("taken_at") or 0
             if y_start <= t < y_end:
                 out.append(it)
-            elif t < y_start and i >= 3:
-                stop = True
+                run = 0
+            elif t < y_start and (page > 0 or i >= PIN_SLOTS):
+                run += 1  # 어제 이전 글이 연속 2개 나오면 더 볼 필요 없음
+                if run >= 2:
+                    stop = True
+            else:
+                run = 0
         cursor = d.get("profile_grid_items_cursor")
         if stop or not d.get("more_available") or not cursor or not items:
             break
