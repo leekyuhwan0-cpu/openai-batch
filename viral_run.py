@@ -9,6 +9,7 @@ import requests
 import poll_batches as pb  # 구글 토큰/시트 헬퍼 재사용
 
 RESULT_SHEET = "1Kdh0gTJYCfYvsUCa5Wqo6a9ITX140q9ovOi9n4HvyGU"
+MAIN_SHEET = "1IK7MbiTFJiV_ofeco9FwYs7UFY_f4QHHIDZJb7T_4-o"  # SOURCE_ACCOUNTS(카테고리/언어 원본)
 DAILY_TAB = "VIRAL_DAILY"
 CONTENTS_TAB = "CONTENTS"
 ASSETS_TAB = "ASSETS"
@@ -189,6 +190,11 @@ def main():
     if not active:
         return
 
+    # 카테고리/언어는 메인 시트 SOURCE_ACCOUNTS(채널명=channel_id)에서 조회 - 한 곳에서만 관리
+    sa_info = {}
+    for _, sd in pb._sheet_values(MAIN_SHEET, "SOURCE_ACCOUNTS")[1]:
+        sa_info[str(sd.get("channel_id", "")).strip()] = (sd.get("category", ""), sd.get("language", ""))
+
     seen = {d.get("게시물링크") for _, d in pb._sheet_values(RESULT_SHEET, DAILY_TAB)[1]}
     root = DRIVE_ROOT_ID or (None if DRY else find_or_create_folder(DRIVE_ROOT_NAME, None))
 
@@ -220,7 +226,7 @@ def main():
                         saved.append(fn)
                 taken = dt.datetime.fromtimestamp(p["taken_at"], KST).strftime("%Y-%m-%d %H:%M")
                 new_rows.append([
-                    today.strftime("%Y-%m-%d"), name, d.get("언어", ""), taken,
+                    today.strftime("%Y-%m-%d"), name, sa_info.get(name, ("", ""))[1] or d.get("언어", ""), taken,
                     p.get("like_count") or 0, p.get("comment_count") or 0, p.get("play_count") or "",
                     kind, len(imgs), link, ((p.get("caption") or {}).get("text") or "")[:500],
                     "\n".join(imgs), "\n".join(vids), "O", "O", ", ".join(saved)])
@@ -230,7 +236,8 @@ def main():
                     cid = f"{name}_{next_num}"
                     caption = ((p.get("caption") or {}).get("text") or "")
                     write_cells([
-                        (f"{CONTENTS_TAB}!A{content_row}", [[d.get("언어", "")]]),  # B(category)는 기존 값 유지
+                        (f"{CONTENTS_TAB}!A{content_row}:B{content_row}", [[
+                            sa_info.get(name, ("", ""))[1] or d.get("언어", ""), sa_info.get(name, ("", ""))[0]]]),
                         (f"{CONTENTS_TAB}!C{content_row}:H{content_row}", [[
                             name, cid, next_num, caption, today.strftime("%Y-%m-%d"), "NEW"]])])
                     for i, (fn, url) in enumerate(img_links):
