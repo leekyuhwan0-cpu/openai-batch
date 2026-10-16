@@ -10,6 +10,8 @@ import poll_batches as pb  # 구글 토큰/시트 헬퍼 재사용
 
 RESULT_SHEET = "1Kdh0gTJYCfYvsUCa5Wqo6a9ITX140q9ovOi9n4HvyGU"
 DAILY_TAB = "VIRAL_DAILY"
+CONTENTS_TAB = "CONTENTS"
+ASSETS_TAB = "ASSETS"
 CHANNEL_TAB = "VIRAL_CHANNELS"
 SC_KEY = os.environ["SCRAPECREATORS_API_KEY"]
 SC_URL = "https://api.scrapecreators.com/v2/instagram/user/posts"
@@ -127,9 +129,42 @@ def upload_bytes(folder_id, name, data, mime):
     body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
             f"{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: {mime}\r\n\r\n").encode() \
         + data + f"\r\n--{boundary}--".encode()
-    pb._request_with_retry(
-        "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+    r = pb._request_with_retry(
+        "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
         headers={"Content-Type": f"multipart/related; boundary={boundary}"}, data=body, timeout=300)
+    return r.json()["id"]
+
+
+def drive_link(file_id):
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def _to_int(v):
+    try:
+        return int(float(str(v).strip()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def next_contents_slot():
+    """CONTENTS에서 (다음 local_file_id, 채울 첫 빈 행 번호). content_id가 빈 행(사전 서식 행)은 재사용."""
+    _, rows = pb._sheet_values(RESULT_SHEET, CONTENTS_TAB)
+    max_num, free_row, last_row = 0, None, 1
+    for rn, d in rows:
+        last_row = max(last_row, rn)
+        if str(d.get("content_id", "")).strip():
+            max_num = max(max_num, _to_int(d.get("local_file_id")))
+        elif free_row is None:
+            free_row = rn
+    return max_num + 1, (free_row or last_row + 1)
+
+
+def append_asset_rows(rows):
+    if DRY or not rows:
+        return
+    _sheets("POST", f"/values/{quote(ASSETS_TAB)}!A1:append",
+            params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+            json={"values": rows})
 
 
 def download(url):
@@ -157,7 +192,8 @@ def main():
     seen = {d.get("게시물링크") for _, d in pb._sheet_values(RESULT_SHEET, DAILY_TAB)[1]}
     root = DRIVE_ROOT_ID or (None if DRY else find_or_create_folder(DRIVE_ROOT_NAME, None))
 
-    new_rows, errors = [], 0
+    next_num, content_row = (1, 2) if DRY else next_contents_slot()
+    new_rows, asset_rows, errors = [], [], 0
     for r, d in active:
         name, handle = d.get("채널명") or d.get("핸들"), d.get("핸들")
         try:
@@ -170,13 +206,14 @@ def main():
                 if link in seen:
                     continue
                 kind, imgs, vids = media_urls(p)
-                saved = []
+                saved, img_links = [], []
                 if not DRY:
                     folder = folder or find_or_create_folder(name, root)
                     for i, u in enumerate(imgs):
                         fn = file_name(name, date_str, code, i, "jpg")
-                        upload_bytes(folder, fn, download(u), "image/jpeg")
+                        fid = upload_bytes(folder, fn, download(u), "image/jpeg")
                         saved.append(fn)
+                        img_links.append((fn, drive_link(fid)))
                     for i, u in enumerate(vids):
                         fn = file_name(name, date_str, code, i, "mp4")
                         upload_bytes(folder, fn, download(u), "video/mp4")
@@ -188,6 +225,18 @@ def main():
                     kind, len(imgs), link, ((p.get("caption") or {}).get("text") or "")[:500],
                     "\n".join(imgs), "\n".join(vids), "O", "O", ", ".join(saved)])
                 seen.add(link)
+                if not DRY and img_links:
+                    # CONTENTS 1행 + ASSETS 슬라이드별 N행 (v2 파이프라인 포맷, 채널 무관 전역 일련번호)
+                    cid = f"{name}_{next_num}"
+                    caption = ((p.get("caption") or {}).get("text") or "")
+                    write_cells([
+                        (f"{CONTENTS_TAB}!A{content_row}", [[d.get("언어", "")]]),  # B(category)는 기존 값 유지
+                        (f"{CONTENTS_TAB}!C{content_row}:H{content_row}", [[
+                            name, cid, next_num, caption, today.strftime("%Y-%m-%d"), "NEW"]])])
+                    for i, (fn, url) in enumerate(img_links):
+                        asset_rows.append([f"{cid}_{i + 1}", cid, fn, i + 1, url])
+                    next_num += 1
+                    content_row += 1
             status = f"OK 어제{len(posts)}/통과{len(hits)}"
         except Exception as e:
             errors += 1
@@ -196,6 +245,7 @@ def main():
         write_cells([(f"{CHANNEL_TAB}!{pb._col_letter(col['마지막수집'])}{r}:{pb._col_letter(col['마지막상태'])}{r}",
                       [[today.strftime("%Y-%m-%d"), status]])])
 
+    append_asset_rows(asset_rows)
     if new_rows and not DRY:
         _sheets("POST", f"/values/{quote(DAILY_TAB)}!A1:append",
                 params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
